@@ -1,86 +1,74 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse
+from fastapi import Depends,status # Assuming you have the FastAPI class for routing
+from fastapi.responses import RedirectResponse,HTMLResponse
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.templating import Jinja2Templates
+from fastapi_login import LoginManager #Loginmanager Class
+from fastapi_login.exceptions import InvalidCredentialsException #Exception class
+import os
+from connmanager import ConnManager
+
+pth = os.path.dirname(__file__)
+templates = Jinja2Templates(directory=os.path.join(pth, "templates"))
+
+SECRET = os.urandom(24).hex()
+# To obtain a suitable secret key you can run | import os; print(os.urandom(24).hex())
+
+manager = LoginManager(SECRET,token_url="/auth/login",use_cookie=True)
+manager.cookie_name = "some-name"
 
 app = FastAPI()
 
-html = """
-<!DOCTYPE html>
-<html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>Real-time Chat</title>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/css/bootstrap.min.css" integrity="sha512-jnSuA4Ss2PkkikSOLtYs8BlYIeeIK1h99ty4YfvRPAlzr377vr3CXDb7sb7eEEBYjDtcYj+AjBH3FLv5uSJuXg==" crossorigin="anonymous" referrerpolicy="no-referrer" />
-    </head>
-    <body>
-        <div class="container mt-3">
-            <h1> WebSocket Chat </h1>
-            <h2> Your connection ID: <span id="ws-id"></span></h2>
-            <form action="" onsubmit="sendMessage(event)">
-                <input type="text" class="form-control" id="messageText" autocomplete="off"/>
-                <button class="btn btn-outline-primary mt-2">Send</button>
-            </form>
-            <ul id="messages" class="mt-5">
-            </ul>
-        </div>
+connected_users = {}
+conn_manager = ConnManager()
 
-        <script type="text/javascript">
-                var client_id = randomInt()
-                document.querySelector("#ws-id").textContent = client_id;
-                var ws = new WebSocket("ws://localhost:8000/ws/"+ client_id)
-    
-                ws.onmessage = function(data){
-                    var messages = document.getElementById('messages')
-                    var message = document.createElement('li')
-                    var content = document.createTextNode(event.data)
-                    message.appendChild(content)
-                    messages.appendChild(message)
-                };
+DB = {"biel":{"password":"qwertyuiop"}, "testing":{"password":"qwertyuiop"}} # unhashed
 
-                function sendMessage(event){
-                    var input = document.getElementById("messageText")
-                    ws.send(input.value)
-                    input.value = ''
-                    event.preventDefault()
-                }
+@manager.user_loader()
+def load_user(username:str):
+    user = DB.get(username)
+    return user
 
-                function randomInt(){
-                    return Math.floor(Math.random()*(200 - 100 + 1)) + 100
-                }
-        </script>
-    </body>
-</html>
-"""
+@app.post("/auth/login")
+def login(data: OAuth2PasswordRequestForm = Depends()):
+    username = data.username
+    password = data.password
+    user = load_user(username)
+    if not user:
+        raise InvalidCredentialsException
+    elif password != user['password']:
+        raise InvalidCredentialsException
 
-class ConnManager:
-    def __init__(self):
-        self.active_conn: list[WebSocket] = []
-        
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_conn.append(websocket)
-    
-    def disconnect(self, websocket: WebSocket):
-        self.active_conn.remove(websocket)
-    
-    async def broadcast(self, message:str):
-        for connections in self.active_conn:
-            await connections.send_text(message)
+    access_token = manager.create_access_token(
+        data={"sub":username}
+    )
+    resp = RedirectResponse(url="/main",status_code=status.HTTP_302_FOUND)
+    manager.set_cookie(resp,access_token)
+    return resp
 
-manager = ConnManager()
+@app.get("/main")
+def getPrivateendpoint(_=Depends(manager)):
+    with open(os.path.join(pth, "templates/main.html")) as f:
+        return HTMLResponse(content=f.read())
 
-@app.get("/")
-async def get():
-    return HTMLResponse(html)
+@app.get("/",response_class=HTMLResponse)
+def loginwithCreds(request:Request):
+    with open(os.path.join(pth, "templates/login.html")) as f:
+        return HTMLResponse(content=f.read())
 
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: int):
-    await manager.connect(websocket)
-    for n in websocket:
-        print(n)
+    await conn_manager.connect(websocket)
+    connected_users[client_id] = websocket
     try:
         while True:
             data = await websocket.receive_text()
-            await manager.broadcast(f"Client #{client_id} said: {data}")
+            for user, _ in connected_users.items():
+                if user != client_id:
+                    await conn_manager.broadcast(user,data)
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        await manager.broadcast(f"Client #{client_id} has disconnected!")
+        conn_manager.disconnect(websocket)
+        for user, _ in connected_users.items():
+                if user != client_id:
+                    await conn_manager.broadcast("Client #{client_id} has disconnected!")
